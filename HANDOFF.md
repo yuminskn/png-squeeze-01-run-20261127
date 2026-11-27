@@ -1,6 +1,75 @@
 # HANDOFF — png-squeeze-01-run-20261127
 
-## ⭐ CURRENT VERSION — v3 driver rewrite of main.ts (2026-11-27, supersedes everything below)
+## ⭐ CURRENT VERSION — v4 official I/O contract rewrite of main.ts (2026-11-27, supersedes everything below)
+
+**HEAD (code): `2bdf4fa78a0fbcc8b87da132e94d5ac3fe7127bf`** — main.ts fourth
+rewrite, written from scratch in two write passes without reading v3.
+
+Why v4: v3 ran cleanly in the sandbox (`run_completes` passed) but the dev
+scoring came back **8 instances, 0 answered, score 0**. The main line then
+read the competition's official rules in full and confirmed the real I/O
+contract; v3 wrote flat answers to `/output/image.png`, but the grader
+collects **`/output/<id>/image.png`** — so no answer ever landed where the
+grader looks. The encoder core was never the problem; every failure so far
+has been I/O contract. v4 fixes exactly that:
+
+1. **Official I/O contract**: instances are the subdirectories of the input
+   dir (`i001`…`i008`); each instance's input is `<id>/image.png` (stored
+   PNG, type 6, filter 0, ~3.7 MB). The answer is written to
+   **`<output>/<id>/image.png`**, and the program creates the `<id>`
+   subdirectory itself (`mkdir -p`). Any subdirectory containing an
+   `image.png` or any other decodable image/raw file counts as an instance
+   (`image.png` preferred, then first decodable file in sorted order).
+2. **Single IDAT**: the encoder emits exactly one IDAT chunk (one
+   `deflateSync` stream); chunks limited to IHDR/PLTE (type 3 only)/tRNS/
+   IDAT/IEND, bit depth 8, non-interlaced, CRCs correct — matching the
+   grader's acceptance list.
+3. Directory resolution unchanged from the confirmed contract: input =
+   `MAKEFUN_INPUT_DIR` → `argv[2]` → `INPUT_DIR` → `/input`; output =
+   `MAKEFUN_OUTPUT_DIR` → `argv[3]` → `OUTPUT_DIR` → `/output`.
+4. Fallback (insurance only, used solely when the main path finds no
+   instance): flat image files in the input dir → `<output>/<basename>.png`;
+   JSON manifest references (`cases.json` or any `.json`) → same, or
+   `<output>/<id>/image.png` when an entry carries an id.
+5. Fault tolerance unchanged in spirit: per-instance try/catch, one bad
+   instance is skipped with a stderr note, no usable input → stderr + exit
+   0, the process always exits 0, output dir is never deleted or cleaned,
+   nothing is written to the input/program dirs, no cwd dependence.
+6. Encoder unchanged from the verified spec: PNG decode (types 0/2/3/4/6,
+   bit depth 8, non-interlaced, full unfilter; also raw RGBA of exactly
+   3,686,400 bytes), per-pixel color-type choice (grey→0, ≤256 colors→3
+   palette+tRNS, grey+alpha→4, opaque→2, else→6, candidates compared by
+   output size), per-row best-of-5 filters by signed-abs sum, DEFLATE
+   parameter search (level 9 / memLevel 9, Z_FILTERED + default, +Z_RLE
+   for ≤2 bpp) keeping the smallest. Pixel-exact including the RGB of
+   fully transparent pixels.
+
+### Verification of v4 (real-layout sandbox simulation, /tmp/sim4)
+
+Setup: `/tmp/sim4/{bot,input,output}`; bot = repo files, chmod read-only;
+input = `i001`…`i008` subdirectories, each holding a stored PNG (type 6,
+filter 0, zlib stored blocks, 3,687,743 bytes) — flat ×2, rich/photo ×2,
+transparent-background ×2, grey ×2. Run exactly as the grader does: env
+only `MAKEFUN_BOT_DIR`/`MAKEFUN_INPUT_DIR`/`MAKEFUN_OUTPUT_DIR`, no argv,
+cwd `/tmp/sim4`, `node /tmp/sim4/bot/main.ts`.
+
+- Exit 0; all 8 answers present at `output/i001..i008/image.png`.
+- Total runtime 3.2 s for all 8 (limit 60 s).
+- Independent Python decoder (from-scratch unfilter + chunk/CRC audit,
+  exactly-one-IDAT asserted): **pixel-exact on all 8**.
+- Strictly smaller than the fixed-Paeth baseline (type 6, Paeth every row,
+  zlib level 9) on all 8: flat 2,585/6,479 (0.399) and 2,480/6,259 (0.396);
+  rich 2,003,720/2,542,778 (0.788) and 2,004,250/2,542,885 (0.788);
+  transparent 28,459/28,944 (0.983) and 36,572/38,042 (0.961);
+  grey 629,674/903,716 (0.697) and 629,820/904,117 (0.697).
+- Every answer ≤ 4 MiB (largest 2,004,250 bytes).
+- Determinism: second run produced byte-identical outputs (sha256 match
+  on all 8).
+- Boundary: empty input dir → exit 0 with stderr note. One instance
+  (`i003`) replaced by a garbage file → that instance skipped, the other
+  7 answers produced and re-verified pixel-exact, exit 0.
+
+## v3 driver rewrite of main.ts (2026-11-27, superseded by v4 above)
 
 The v2 rewrite below was submitted, but the platform's dev scoring run
 exited 1 (check name: `run_completes`). The main line reproduced the
