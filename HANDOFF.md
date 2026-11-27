@@ -1,5 +1,70 @@
 # HANDOFF — png-squeeze-01-run-20261127
 
+## ⭐ CURRENT VERSION — full rewrite of main.ts (2026-11-27, supersedes everything below)
+
+The previous main.ts (builder-written, then hand-edited by the main line)
+was rejected at submission time by make.fun's transcript-consistency
+check: the submitted source must be reproducible from the building
+session's record. The current main.ts was therefore rewritten FROM
+SCRATCH from the spec, in a single session, in two write passes, without
+reading the old file. The sections below describe the superseded version
+and are kept for history only.
+
+- main.ts rewrite commit: `be739176e7fd101d17f8e324ccd8ef59a8828d11`
+  (on top of `0de562b`, anchor history intact: de96253 → 654d6cf → 0de562b → be73917)
+- main.ts size: ≈17.2 KB. Node built-ins only (node:fs / node:path /
+  node:zlib); no packages, no network, no randomness, no timestamps.
+- Inputs: PNG files (own chunk parser + inflate + all-5-filter unfilter,
+  colour types 0/2/3/4/6, bit depth 8, non-interlaced, 1280×720), raw
+  RGBA files (exactly 3,686,400 bytes), and a JSON manifest (cases.json:
+  {"cases":[{"id","input"}]} or bare array; input = sibling file name or
+  base64 raw RGBA). Unrecognised files are skipped with a stderr note.
+- Outputs: one `<basename>.png` per input into argv[3] / OUTPUT_DIR /
+  /output (mkdir -p; the output directory itself is never removed).
+- Encoding: per-image analysis picks colour type (grey 0 / palette 3
+  +tRNS / grey+alpha 4 / RGB 2 / RGBA 6; multiple candidates built, the
+  smallest kept); per-row adaptive filtering (all 5 filters, min
+  signed-abs cost); DEFLATE tried at level 9 / level 9+memLevel 9 /
+  level 9+Z_FILTERED, smallest kept. Output chunks: IHDR/PLTE/tRNS/
+  IDAT/IEND only, bit depth 8, non-interlaced.
+
+### Verification (independent Python decoder, /tmp/pngtest3/verify.py)
+
+4 synthetic 1280×720 images × 2 input forms (stored PNG in the house
+format + raw RGBA) = 8 inputs; every output independently decoded and
+compared against the source RGBA:
+
+| image | mine (bytes) | fixed-Paeth baseline | ratio | colour type | pixel-exact |
+|---|---|---|---|---|---|
+| flat-ui (PNG & raw inputs) | 2,785 | 9,552 | 0.292 | 3 | ✅ |
+| photo-noise (PNG & raw) | 2,005,752 | 2,505,521 | 0.801 | 2 | ✅ |
+| grey-doc (PNG & raw) | 2,228 | 5,670 | 0.393 | 0 | ✅ |
+| flat-alpha (PNG & raw) | 1,943 | 5,395 | 0.360 | 3 (+tRNS) | ✅ |
+
+- Totals (PNG inputs): 2,012,708 vs baseline 2,526,138 → 20.32% smaller;
+  every single image strictly below baseline.
+- flat-alpha includes fully transparent pixels with non-zero RGB —
+  decoded output matches byte-for-byte, so transparent RGB is preserved.
+- Determinism: two full runs byte-identical. PASS.
+- Timing: 8 images in 2.99 s (limit 60 s). PASS.
+- Manifest path separately tested (file-name entry + base64 entry):
+  both outputs pixel-exact. PASS.
+- Result: ALL PASS.
+
+### Submission parameters (for the main line — NOT submitted here)
+
+- Competition slug: `png-squeeze-01-run-20261127`
+- Submit the local commit `be739176e7fd101d17f8e324ccd8ef59a8828d11`
+  (its history root is the makefun anchor, as required).
+- NOTE: the GitHub remote still holds the OLD main.ts from the earlier
+  Contents-API push; the main line must push the new main.ts (and this
+  HANDOFF) so the remote matches the submitted commit before submitting.
+- Deadline: 2026-11-29T05:00Z = Taiwan 2026-11-29 13:00.
+
+---
+
+## (Superseded) first builder version
+
 ## Repo
 
 - Repo: https://github.com/yuminskn/png-squeeze-01-run-20261127 (public, created after opening)
