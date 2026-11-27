@@ -1,35 +1,33 @@
 // png-squeeze: lossless PNG re-encoder.
 //
-// Reads images (PNG files, or raw RGBA buffers of exactly 3,686,400 bytes)
-// from an input directory and writes the smallest lossless PNG it can build
-// for each one into an output directory. Every output pixel is identical to
-// the input pixel, including the RGB of fully transparent pixels.
+// Contract (from the competition rules):
+//   input : /input/<id>/image.png   (one subdirectory per instance, id = i001..i008)
+//   output: /output/<id>/image.png  (this program creates the <id> subdirectory)
+// The encoder re-encodes each image losslessly (every pixel identical,
+// including the RGB of fully transparent pixels) into the smallest PNG it
+// can produce: bit depth 8, non-interlaced, color type 0/2/3/4/6, chunks
+// limited to IHDR/PLTE/tRNS/IDAT/IEND, and exactly one IDAT chunk.
 //
-// Node builtins only, no network, deterministic output.
-// The driver never aborts the batch on a single bad input and always exits 0.
+// Node built-ins only (node:fs, node:path, node:zlib). No packages, no
+// network. The driver at the bottom is fault tolerant: one bad instance
+// never fails the run, and the process always exits 0.
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as zlib from "node:zlib";
-
-const RAW_W = 1280;
-const RAW_H = 720;
-const RAW_LEN = RAW_W * RAW_H * 4; // 3,686,400
-
-const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname, basename, extname } from 'node:path';
+import { deflateSync, inflateSync, constants as ZC } from 'node:zlib';
 
 // ---------------------------------------------------------------------------
 // CRC32 (PNG chunk checksums)
 // ---------------------------------------------------------------------------
 
 const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
+  const table = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
+    table[n] = c;
   }
-  return t;
+  return table;
 })();
 
 function crc32(buf) {
@@ -39,21 +37,6 @@ function crc32(buf) {
   }
   return (c ^ 0xffffffff) >>> 0;
 }
-
-function chunk(type, data) {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// PNG decoding: chunks -> inflate -> unfilter -> raw RGBA
-// Supports color types 0/2/3/4/6, bit depth 8, non-interlaced.
-// Returns { width, height, rgba } or null when the buffer is not such a PNG.
-// ---------------------------------------------------------------------------
 
 function paeth(a, b, c) {
   const p = a + b - c;
@@ -65,6 +48,16 @@ function paeth(a, b, c) {
   return c;
 }
 
+// ---------------------------------------------------------------------------
+// PNG decoding -> raw RGBA
+// Supports color types 0/2/3/4/6, bit depth 8, non-interlaced.
+// Also accepts a raw RGBA dump of exactly 1280*720*4 = 3,686,400 bytes.
+// Returns { width, height, rgba } or null when undecodable.
+// ---------------------------------------------------------------------------
+
+const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const RAW_RGBA_BYTES = 1280 * 720 * 4;
+
 function decodePng(buf) {
   if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIG)) return null;
   let pos = 8;
@@ -73,73 +66,75 @@ function decodePng(buf) {
   let bitDepth = 0;
   let colorType = -1;
   let interlace = 0;
-  let palette = null;
+  let plte = null;
   let trns = null;
   const idatParts = [];
   while (pos + 8 <= buf.length) {
     const len = buf.readUInt32BE(pos);
-    const type = buf.toString("ascii", pos + 4, pos + 8);
+    const type = buf.toString('ascii', pos + 4, pos + 8);
     const dataStart = pos + 8;
     const dataEnd = dataStart + len;
-    if (dataEnd > buf.length) return null;
+    if (dataEnd + 4 > buf.length) return null;
     const data = buf.subarray(dataStart, dataEnd);
-    if (type === "IHDR") {
+    if (type === 'IHDR') {
       width = data.readUInt32BE(0);
       height = data.readUInt32BE(4);
       bitDepth = data[8];
       colorType = data[9];
       interlace = data[12];
-    } else if (type === "PLTE") {
-      palette = data;
-    } else if (type === "tRNS") {
-      trns = data;
-    } else if (type === "IDAT") {
-      idatParts.push(data);
-    } else if (type === "IEND") {
+    } else if (type === 'PLTE') {
+      plte = Buffer.from(data);
+    } else if (type === 'tRNS') {
+      trns = Buffer.from(data);
+    } else if (type === 'IDAT') {
+      idatParts.push(Buffer.from(data));
+    } else if (type === 'IEND') {
       break;
     }
-    pos = dataEnd + 4; // skip chunk + CRC
+    pos = dataEnd + 4;
   }
-  if (!width || !height || bitDepth !== 8 || interlace !== 0) return null;
-  const channelsByType = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
-  const channels = channelsByType[colorType];
+  if (!width || !height || colorType < 0 || bitDepth !== 8 || interlace !== 0) {
+    return null;
+  }
+  const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType];
   if (!channels) return null;
-  if (colorType === 3 && !palette) return null;
+  if (colorType === 3 && !plte) return null;
 
   let raw;
   try {
-    raw = zlib.inflateSync(Buffer.concat(idatParts));
+    raw = inflateSync(Buffer.concat(idatParts));
   } catch {
     return null;
   }
-  const bpp = channels;
   const rowBytes = width * channels;
-  if (raw.length < height * (rowBytes + 1)) return null;
+  if (raw.length < (rowBytes + 1) * height) return null;
 
-  // Unfilter.
-  const px = Buffer.alloc(height * rowBytes);
+  // Unfilter into packed pixel bytes.
+  const px = Buffer.alloc(rowBytes * height);
+  let prev = Buffer.alloc(rowBytes);
   for (let y = 0; y < height; y++) {
     const f = raw[y * (rowBytes + 1)];
-    if (f > 4) return null;
-    const srcOff = y * (rowBytes + 1) + 1;
+    const rowOff = y * (rowBytes + 1) + 1;
     const outOff = y * rowBytes;
-    const prevOff = outOff - rowBytes;
     for (let x = 0; x < rowBytes; x++) {
-      const v = raw[srcOff + x];
-      const a = x >= bpp ? px[outOff + x - bpp] : 0;
-      const b = y > 0 ? px[prevOff + x] : 0;
-      const c = y > 0 && x >= bpp ? px[prevOff + x - bpp] : 0;
+      const v = raw[rowOff + x];
+      const a = x >= channels ? px[outOff + x - channels] : 0;
+      const b = prev[x];
+      const c = x >= channels ? prev[x - channels] : 0;
       let r;
       if (f === 0) r = v;
-      else if (f === 1) r = v + a;
-      else if (f === 2) r = v + b;
-      else if (f === 3) r = v + ((a + b) >> 1);
-      else r = v + paeth(a, b, c);
-      px[outOff + x] = r & 0xff;
+      else if (f === 1) r = (v + a) & 0xff;
+      else if (f === 2) r = (v + b) & 0xff;
+      else if (f === 3) r = (v + ((a + b) >> 1)) & 0xff;
+      else if (f === 4) r = (v + paeth(a, b, c)) & 0xff;
+      else return null;
+      px[outOff + x] = r;
     }
+    prev = px.subarray(outOff, outOff + rowBytes);
   }
 
-  // Convert to RGBA, honouring tRNS so transparent pixels keep their RGB.
+  // Expand to RGBA. tRNS values for bit depth 8 are stored as 16-bit fields
+  // whose numeric value equals the 8-bit sample.
   const rgba = Buffer.alloc(width * height * 4);
   if (colorType === 6) {
     px.copy(rgba);
@@ -148,28 +143,26 @@ function decodePng(buf) {
     let tg = -1;
     let tb = -1;
     if (trns && trns.length >= 6) {
-      tr = trns.readUInt16BE(0) & 0xff;
-      tg = trns.readUInt16BE(2) & 0xff;
-      tb = trns.readUInt16BE(4) & 0xff;
+      tr = trns.readUInt16BE(0);
+      tg = trns.readUInt16BE(2);
+      tb = trns.readUInt16BE(4);
     }
     for (let i = 0, j = 0; i < px.length; i += 3, j += 4) {
-      const r = px[i];
-      const g = px[i + 1];
-      const b = px[i + 2];
-      rgba[j] = r;
-      rgba[j + 1] = g;
-      rgba[j + 2] = b;
-      rgba[j + 3] = r === tr && g === tg && b === tb ? 0 : 255;
+      rgba[j] = px[i];
+      rgba[j + 1] = px[i + 1];
+      rgba[j + 2] = px[i + 2];
+      rgba[j + 3] =
+        tr >= 0 && px[i] === tr && px[i + 1] === tg && px[i + 2] === tb ? 0 : 255;
     }
   } else if (colorType === 0) {
-    let tGrey = -1;
-    if (trns && trns.length >= 2) tGrey = trns.readUInt16BE(0) & 0xff;
+    let tg = -1;
+    if (trns && trns.length >= 2) tg = trns.readUInt16BE(0);
     for (let i = 0, j = 0; i < px.length; i++, j += 4) {
       const g = px[i];
       rgba[j] = g;
       rgba[j + 1] = g;
       rgba[j + 2] = g;
-      rgba[j + 3] = g === tGrey ? 0 : 255;
+      rgba[j + 3] = tg >= 0 && g === tg ? 0 : 255;
     }
   } else if (colorType === 4) {
     for (let i = 0, j = 0; i < px.length; i += 2, j += 4) {
@@ -182,29 +175,28 @@ function decodePng(buf) {
   } else if (colorType === 3) {
     for (let i = 0, j = 0; i < px.length; i++, j += 4) {
       const idx = px[i];
-      const pOff = idx * 3;
-      if (pOff + 2 >= palette.length) return null;
-      rgba[j] = palette[pOff];
-      rgba[j + 1] = palette[pOff + 1];
-      rgba[j + 2] = palette[pOff + 2];
+      const p = idx * 3;
+      rgba[j] = p + 2 < plte.length ? plte[p] : 0;
+      rgba[j + 1] = p + 2 < plte.length ? plte[p + 1] : 0;
+      rgba[j + 2] = p + 2 < plte.length ? plte[p + 2] : 0;
       rgba[j + 3] = trns && idx < trns.length ? trns[idx] : 255;
     }
   }
   return { width, height, rgba };
 }
 
-// Accept a PNG buffer or a raw RGBA buffer of exactly RAW_LEN bytes.
-// Returns { width, height, rgba } or null. Never throws.
-function toRgba(buf) {
+function decodeAny(buf) {
+  const png = decodePng(buf);
+  if (png) return png;
+  if (buf.length === RAW_RGBA_BYTES) {
+    return { width: 1280, height: 720, rgba: Buffer.from(buf) };
+  }
+  return null;
+}
+
+function loadImage(path) {
   try {
-    if (!buf || buf.length === 0) return null;
-    if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIG)) {
-      return decodePng(buf);
-    }
-    if (buf.length === RAW_LEN) {
-      return { width: RAW_W, height: RAW_H, rgba: Buffer.from(buf) };
-    }
-    return null;
+    return decodeAny(readFileSync(path));
   } catch {
     return null;
   }
@@ -212,181 +204,190 @@ function toRgba(buf) {
 
 // ---------------------------------------------------------------------------
 // PNG encoding: pick the smallest lossless representation.
-// Candidate color types (only those that reproduce every pixel exactly):
-//   0 grey           - all pixels grey and opaque
-//   3 palette + tRNS - at most 256 distinct RGBA colors
-//   4 grey + alpha   - all pixels grey
-//   2 RGB            - all pixels opaque
-//   6 RGBA           - always
-// Per row, all 5 filters are tried and the one with the smallest sum of
-// absolute signed filtered bytes wins. The filtered stream is deflated with
-// several parameter sets and the smallest result is kept.
-// Output uses only IHDR / PLTE / tRNS / IDAT / IEND, bit depth 8,
-// non-interlaced.
 // ---------------------------------------------------------------------------
 
-function analyzePixels(rgba, npix) {
-  let allGray = true;
+function analyze(rgba) {
+  let allGrey = true;
   let allOpaque = true;
-  const colors = new Map(); // packed RGBA -> palette index (first-appearance order)
-  let paletteOverflow = false;
-  for (let i = 0; i < npix; i++) {
-    const o = i * 4;
-    const r = rgba[o];
-    const g = rgba[o + 1];
-    const b = rgba[o + 2];
-    const a = rgba[o + 3];
-    if (r !== g || g !== b) allGray = false;
+  const colors = new Map(); // rgba uint32 -> palette index (first-appearance order)
+  let overflow = false;
+  for (let i = 0; i < rgba.length; i += 4) {
+    const r = rgba[i];
+    const g = rgba[i + 1];
+    const b = rgba[i + 2];
+    const a = rgba[i + 3];
+    if (r !== g || g !== b) allGrey = false;
     if (a !== 255) allOpaque = false;
-    if (!paletteOverflow) {
+    if (!overflow) {
       const key = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
       if (!colors.has(key)) {
-        if (colors.size >= 256) paletteOverflow = true;
-        else colors.set(key, colors.size);
+        colors.set(key, colors.size);
+        if (colors.size > 256) overflow = true;
       }
     }
   }
-  return { allGray, allOpaque, colors: paletteOverflow ? null : colors };
+  return { allGrey, allOpaque, colors: overflow ? null : colors };
 }
 
-function filterRowBytes(filter, row, prev, bpp) {
-  const out = Buffer.alloc(row.length);
-  for (let x = 0; x < row.length; x++) {
-    const a = x >= bpp ? row[x - bpp] : 0;
-    const b = prev ? prev[x] : 0;
-    const c = prev && x >= bpp ? prev[x - bpp] : 0;
-    let p = 0;
-    if (filter === 1) p = a;
-    else if (filter === 2) p = b;
-    else if (filter === 3) p = (a + b) >> 1;
-    else if (filter === 4) p = paeth(a, b, c);
-    out[x] = (row[x] - p) & 0xff;
+// Pack RGBA pixels into the byte layout of the given color type.
+function packRows(rgba, colorType, colors) {
+  const n = rgba.length / 4;
+  if (colorType === 6) return Buffer.from(rgba);
+  if (colorType === 2) {
+    const out = Buffer.alloc(n * 3);
+    for (let i = 0, j = 0; j < rgba.length; i += 3, j += 4) {
+      out[i] = rgba[j];
+      out[i + 1] = rgba[j + 1];
+      out[i + 2] = rgba[j + 2];
+    }
+    return out;
+  }
+  if (colorType === 0) {
+    const out = Buffer.alloc(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) out[i] = rgba[j];
+    return out;
+  }
+  if (colorType === 4) {
+    const out = Buffer.alloc(n * 2);
+    for (let i = 0, j = 0; j < rgba.length; i += 2, j += 4) {
+      out[i] = rgba[j];
+      out[i + 1] = rgba[j + 3];
+    }
+    return out;
+  }
+  // colorType === 3: palette indices
+  const out = Buffer.alloc(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const key =
+      ((rgba[j] << 24) | (rgba[j + 1] << 16) | (rgba[j + 2] << 8) | rgba[j + 3]) >>> 0;
+    out[i] = colors.get(key);
   }
   return out;
 }
 
-function signedAbsSum(buf) {
-  let s = 0;
-  for (let i = 0; i < buf.length; i++) {
-    const v = buf[i];
-    s += v < 128 ? v : 256 - v;
-  }
-  return s;
-}
-
-function filterImage(data, width, height, bpp) {
+// Filter every row with all 5 PNG filters; keep, per row, the filter whose
+// output has the smallest sum of absolute signed byte values.
+function filterStream(packed, width, height, bpp) {
   const rowBytes = width * bpp;
-  const out = Buffer.alloc(height * (rowBytes + 1));
-  let prev = null;
+  const out = Buffer.alloc((rowBytes + 1) * height);
+  const cand = Buffer.alloc(rowBytes);
+  let prev = Buffer.alloc(rowBytes);
   for (let y = 0; y < height; y++) {
-    const row = data.subarray(y * rowBytes, (y + 1) * rowBytes);
-    let bestFilter = 0;
-    let bestData = null;
-    let bestScore = Infinity;
-    for (let f = 0; f <= 4; f++) {
-      const fd = filterRowBytes(f, row, prev, bpp);
-      const sc = signedAbsSum(fd);
-      if (sc < bestScore) {
-        bestScore = sc;
-        bestFilter = f;
-        bestData = fd;
+    const row = packed.subarray(y * rowBytes, (y + 1) * rowBytes);
+    let bestType = 0;
+    let bestCost = Infinity;
+    let bestRow = null;
+    for (let f = 0; f < 5; f++) {
+      let cost = 0;
+      for (let x = 0; x < rowBytes; x++) {
+        const a = x >= bpp ? row[x - bpp] : 0;
+        const b = prev[x];
+        const c = x >= bpp ? prev[x - bpp] : 0;
+        let pred = 0;
+        if (f === 1) pred = a;
+        else if (f === 2) pred = b;
+        else if (f === 3) pred = (a + b) >> 1;
+        else if (f === 4) pred = paeth(a, b, c);
+        const d = (row[x] - pred) & 0xff;
+        cand[x] = d;
+        cost += d < 128 ? d : 256 - d;
+      }
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestType = f;
+        bestRow = Buffer.from(cand);
       }
     }
-    const off = y * (rowBytes + 1);
-    out[off] = bestFilter;
-    bestData.copy(out, off + 1);
-    prev = row;
+    const outOff = y * (rowBytes + 1);
+    out[outOff] = bestType;
+    bestRow.copy(out, outOff + 1);
+    prev = Buffer.from(row);
   }
   return out;
 }
 
-const DEFLATE_SETS = [
-  { level: 9, memLevel: 9, strategy: zlib.constants.Z_FILTERED },
-  { level: 9, memLevel: 9, strategy: zlib.constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 9, strategy: zlib.constants.Z_RLE },
-];
-
-function deflateBest(data) {
-  const sets = data.length > 2_000_000 ? DEFLATE_SETS.slice(0, 2) : DEFLATE_SETS;
+function deflateBest(stream, bpp) {
+  const tries = [
+    { level: 9, memLevel: 9, strategy: ZC.Z_FILTERED },
+    { level: 9, memLevel: 9, strategy: ZC.Z_DEFAULT_STRATEGY },
+  ];
+  if (bpp <= 2) tries.push({ level: 9, memLevel: 9, strategy: ZC.Z_RLE });
   let best = null;
-  for (const opts of sets) {
-    const d = zlib.deflateSync(data, opts);
-    if (!best || d.length < best.length) best = d;
+  for (const opts of tries) {
+    const z = deflateSync(stream, opts);
+    if (!best || z.length < best.length) best = z;
   }
   return best;
 }
 
-function encodePng(img) {
-  const { width, height, rgba } = img;
-  const npix = width * height;
-  const info = analyzePixels(rgba, npix);
-  const candidates = [];
+function chunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
 
-  if (info.allGray && info.allOpaque) {
-    const data = Buffer.alloc(npix);
-    for (let i = 0; i < npix; i++) data[i] = rgba[i * 4];
-    candidates.push({ colorType: 0, bpp: 1, data, plte: null, trns: null });
-  }
-  if (info.colors) {
-    const n = info.colors.size;
-    const plte = Buffer.alloc(n * 3);
-    const alphas = new Array(n).fill(255);
-    for (const [key, idx] of info.colors) {
+function encodeCandidate(width, height, rgba, colorType, colors) {
+  const bpp = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType];
+  const packed = packRows(rgba, colorType, colors);
+  const stream = filterStream(packed, width, height, bpp);
+  const idat = deflateBest(stream, bpp);
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = colorType;
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter method
+  ihdr[12] = 0; // non-interlaced
+
+  const parts = [PNG_SIG, chunk('IHDR', ihdr)];
+  if (colorType === 3) {
+    const plte = Buffer.alloc(colors.size * 3);
+    const alphas = new Uint8Array(colors.size).fill(255);
+    for (const [key, idx] of colors) {
       plte[idx * 3] = (key >>> 24) & 0xff;
       plte[idx * 3 + 1] = (key >>> 16) & 0xff;
       plte[idx * 3 + 2] = (key >>> 8) & 0xff;
       alphas[idx] = key & 0xff;
     }
-    let trns = null;
+    parts.push(chunk('PLTE', plte));
     let lastAlpha = -1;
-    for (let i = 0; i < n; i++) if (alphas[i] !== 255) lastAlpha = i;
-    if (lastAlpha >= 0) trns = Buffer.from(alphas.slice(0, lastAlpha + 1));
-    const data = Buffer.alloc(npix);
-    for (let i = 0; i < npix; i++) {
-      const o = i * 4;
-      const key = ((rgba[o] << 24) | (rgba[o + 1] << 16) | (rgba[o + 2] << 8) | rgba[o + 3]) >>> 0;
-      data[i] = info.colors.get(key);
+    for (let i = 0; i < alphas.length; i++) {
+      if (alphas[i] !== 255) lastAlpha = i;
     }
-    candidates.push({ colorType: 3, bpp: 1, data, plte, trns });
-  }
-  if (info.allGray) {
-    const data = Buffer.alloc(npix * 2);
-    for (let i = 0; i < npix; i++) {
-      data[i * 2] = rgba[i * 4];
-      data[i * 2 + 1] = rgba[i * 4 + 3];
+    if (lastAlpha >= 0) {
+      parts.push(chunk('tRNS', Buffer.from(alphas.subarray(0, lastAlpha + 1))));
     }
-    candidates.push({ colorType: 4, bpp: 2, data, plte: null, trns: null });
   }
-  if (info.allOpaque) {
-    const data = Buffer.alloc(npix * 3);
-    for (let i = 0, j = 0; i < npix; i++, j += 3) {
-      data[j] = rgba[i * 4];
-      data[j + 1] = rgba[i * 4 + 1];
-      data[j + 2] = rgba[i * 4 + 2];
-    }
-    candidates.push({ colorType: 2, bpp: 3, data, plte: null, trns: null });
-  }
-  candidates.push({ colorType: 6, bpp: 4, data: rgba, plte: null, trns: null });
+  parts.push(chunk('IDAT', idat)); // exactly one IDAT chunk
+  parts.push(chunk('IEND', Buffer.alloc(0)));
+  return Buffer.concat(parts);
+}
 
+function encodePng(width, height, rgba) {
+  const { allGrey, allOpaque, colors } = analyze(rgba);
+  const candidates = [];
+  if (allGrey && allOpaque) {
+    candidates.push(0);
+    if (colors) candidates.push(3);
+  } else if (allGrey) {
+    candidates.push(4);
+    if (colors) candidates.push(3);
+  } else if (colors) {
+    candidates.push(3);
+  } else if (allOpaque) {
+    candidates.push(2);
+  } else {
+    candidates.push(6);
+  }
   let best = null;
-  for (const cand of candidates) {
-    const filtered = filterImage(cand.data, width, height, cand.bpp);
-    const idat = deflateBest(filtered);
-    const ihdr = Buffer.alloc(13);
-    ihdr.writeUInt32BE(width, 0);
-    ihdr.writeUInt32BE(height, 4);
-    ihdr[8] = 8; // bit depth
-    ihdr[9] = cand.colorType;
-    ihdr[10] = 0; // compression
-    ihdr[11] = 0; // filter method
-    ihdr[12] = 0; // non-interlaced
-    const parts = [PNG_SIG, chunk("IHDR", ihdr)];
-    if (cand.plte) parts.push(chunk("PLTE", cand.plte));
-    if (cand.trns) parts.push(chunk("tRNS", cand.trns));
-    parts.push(chunk("IDAT", idat));
-    parts.push(chunk("IEND", Buffer.alloc(0)));
-    const png = Buffer.concat(parts);
-    if (!best || png.length < best.length) best = png;
+  for (const ct of candidates) {
+    const out = encodeCandidate(width, height, rgba, ct, colors);
+    if (!best || out.length < best.length) best = out;
   }
   return best;
 }
@@ -394,200 +395,190 @@ function encodePng(img) {
 // ---------------------------------------------------------------------------
 // Driver
 //
-// Input directory resolution order:
-//   MAKEFUN_INPUT_DIR -> argv[2] -> INPUT_DIR -> "/input"
-// Output directory resolution order:
-//   MAKEFUN_OUTPUT_DIR -> argv[3] -> OUTPUT_DIR -> "/output"
+// Input dir : MAKEFUN_INPUT_DIR -> argv[2] -> INPUT_DIR -> /input
+// Output dir: MAKEFUN_OUTPUT_DIR -> argv[3] -> OUTPUT_DIR -> /output
 //
-// The input directory is searched recursively (at least 3 levels deep).
-// A JSON manifest (cases.json or any .json file) of the form
-//   {"cases":[{"id": "...", "input": "file.png"}]}
-// or a bare array of such cases is honoured when it actually resolves to
-// valid inputs; "input" is a file name relative to the manifest's directory
-// or a base64-encoded raw RGBA buffer. A broken manifest never fails the
-// run: the driver falls through to a plain file scan.
+// Main path: every subdirectory <id> of the input dir that contains an
+// image.png (or any other decodable image/raw file) is one instance; its
+// answer goes to <output>/<id>/image.png, creating the subdirectory.
+// Fallback (only when the main path finds no instance at all): flat image
+// files in the input dir and files referenced by a JSON manifest are
+// written to <output>/<basename>.png (or <output>/<id>/image.png when a
+// manifest entry carries an id).
 //
-// Every candidate file is probed with toRgba; failures are logged to stderr
-// and skipped, never thrown. Each image is encoded inside its own try/catch.
-// The output directory is created if needed and is never deleted or cleaned.
-// When no usable input exists the driver logs to stderr and still exits 0.
+// Every instance is isolated in try/catch; the process always exits 0.
+// Nothing is ever deleted, the input dir and the program dir are never
+// written to, and no path depends on the current working directory.
 // ---------------------------------------------------------------------------
 
-const MAX_INPUT_BYTES = 32 * 1024 * 1024;
+function resolveDirs() {
+  const inputDir =
+    process.env.MAKEFUN_INPUT_DIR || process.argv[2] || process.env.INPUT_DIR || '/input';
+  const outputDir =
+    process.env.MAKEFUN_OUTPUT_DIR ||
+    process.argv[3] ||
+    process.env.OUTPUT_DIR ||
+    '/output';
+  return { inputDir, outputDir };
+}
 
-function eprint(msg) {
+function listEntries(dir) {
   try {
-    process.stderr.write(String(msg) + "\n");
+    return readdirSync(dir, { withFileTypes: true });
   } catch {
-    // stderr itself is broken; nothing useful left to do.
+    return [];
   }
 }
 
-function resolveDir(primaryEnv, argvIdx, fallbackEnv, fallbackPath) {
-  if (process.env[primaryEnv]) return process.env[primaryEnv];
-  if (process.argv[argvIdx]) return process.argv[argvIdx];
-  if (process.env[fallbackEnv]) return process.env[fallbackEnv];
-  return fallbackPath;
+function sortedNames(entries, wantDirs) {
+  return entries
+    .filter((e) => (wantDirs ? e.isDirectory() : e.isFile()))
+    .map((e) => e.name)
+    .sort();
 }
 
-function safeReadFile(p) {
-  try {
-    const st = fs.statSync(p);
-    if (!st.isFile() || st.size > MAX_INPUT_BYTES) return null;
-    return fs.readFileSync(p);
-  } catch {
-    return null;
-  }
-}
-
-function stripExt(name) {
-  const i = name.lastIndexOf(".");
-  return i > 0 ? name.slice(0, i) : name;
-}
-
-// Recursively collect files under dir, at least 3 directory levels deep,
-// in deterministic (sorted) order.
-function walkFiles(dir, depth, out) {
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  for (const e of entries) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      if (depth < 3) walkFiles(p, depth + 1, out);
-    } else if (e.isFile()) {
-      out.push(p);
-    }
-  }
-}
-
-// Try to build jobs from a JSON manifest among the collected files.
-// Returns an array of { name, buf } or null when no manifest yields at
-// least one valid input.
-function manifestJobs(files) {
-  for (const f of files) {
-    if (!f.toLowerCase().endsWith(".json")) continue;
-    let parsed;
-    try {
-      const text = fs.readFileSync(f, "utf8");
-      parsed = JSON.parse(text);
-    } catch {
-      continue; // not parseable: not a manifest, keep looking / fall through
-    }
-    const cases = Array.isArray(parsed)
-      ? parsed
-      : parsed && Array.isArray(parsed.cases)
-        ? parsed.cases
-        : null;
-    if (!cases || cases.length === 0) continue;
-    const dir = path.dirname(f);
-    const jobs = [];
-    for (const c of cases) {
-      if (!c || typeof c.input !== "string" || c.input.length === 0) continue;
-      const filePath = path.resolve(dir, c.input);
-      let buf = safeReadFile(filePath);
-      let fromFile = buf !== null;
-      if (!buf) {
-        try {
-          const decoded = Buffer.from(c.input, "base64");
-          if (decoded.length === RAW_LEN) buf = decoded;
-        } catch {
-          buf = null;
-        }
-        fromFile = false;
-      }
-      if (!buf) continue;
-      if (!toRgba(buf)) continue; // manifest only counts if inputs are valid
-      const name = fromFile
-        ? stripExt(path.basename(c.input))
-        : typeof c.id === "string" && c.id
-          ? stripExt(c.id)
-          : "image";
-      jobs.push({ name, buf });
-    }
-    if (jobs.length > 0) return jobs;
+// First decodable image in a directory: image.png first, then the other
+// files in sorted order. Returns the decoded image or null.
+function firstImageIn(dir) {
+  const names = sortedNames(listEntries(dir), false);
+  const ordered = [];
+  if (names.includes('image.png')) ordered.push('image.png');
+  for (const n of names) if (n !== 'image.png') ordered.push(n);
+  for (const n of ordered) {
+    const img = loadImage(join(dir, n));
+    if (img) return img;
   }
   return null;
 }
 
-function collectJobs(inPath) {
-  let st = null;
-  try {
-    st = fs.statSync(inPath);
-  } catch {
-    st = null;
+function writeAnswer(img, destPath) {
+  const out = encodePng(img.width, img.height, img.rgba);
+  mkdirSync(dirname(destPath), { recursive: true });
+  writeFileSync(destPath, out);
+  return out.length;
+}
+
+// Collect { id, path } references from a parsed JSON manifest, tolerating
+// arrays of strings/objects and objects with cases/items/files lists.
+function manifestRefs(node, refs, seen) {
+  if (node == null || typeof node !== 'object' || seen.has(node)) return;
+  seen.add(node);
+  if (Array.isArray(node)) {
+    for (const item of node) manifestRefs(item, refs, seen);
+    return;
   }
-  if (st && st.isFile()) {
-    const buf = safeReadFile(inPath);
-    if (!buf) return [];
-    return [{ name: stripExt(path.basename(inPath)), buf }];
+  const pathVal =
+    typeof node.path === 'string'
+      ? node.path
+      : typeof node.file === 'string'
+        ? node.file
+        : typeof node.input === 'string'
+          ? node.input
+          : typeof node.src === 'string'
+            ? node.src
+            : null;
+  if (pathVal) {
+    const id =
+      typeof node.id === 'string'
+        ? node.id
+        : typeof node.name === 'string'
+          ? node.name
+          : null;
+    refs.push({ id, path: pathVal });
   }
-  if (st && st.isDirectory()) {
-    const files = [];
-    walkFiles(inPath, 0, files);
-    const fromManifest = manifestJobs(files);
-    if (fromManifest) return fromManifest;
-    const jobs = [];
-    for (const f of files) {
-      const buf = safeReadFile(f);
-      if (buf) jobs.push({ name: stripExt(path.basename(f)), buf });
+  for (const v of Object.values(node)) manifestRefs(v, refs, seen);
+}
+
+function runFallback(inputDir, outputDir) {
+  let done = 0;
+  const handledSrc = new Set();
+
+  // Flat image files in the input dir (first level only).
+  for (const name of sortedNames(listEntries(inputDir), false)) {
+    if (name.toLowerCase().endsWith('.json')) continue;
+    const src = join(inputDir, name);
+    try {
+      const img = loadImage(src);
+      if (!img) continue;
+      const base = basename(name, extname(name));
+      writeAnswer(img, join(outputDir, base + '.png'));
+      handledSrc.add(src);
+      done++;
+    } catch (e) {
+      console.error(`png-squeeze: fallback file ${name} failed: ${e.message}`);
     }
-    return jobs;
   }
-  return [];
+
+  // JSON manifests: cases.json first, then any other .json file.
+  const jsonNames = sortedNames(listEntries(inputDir), false).filter((n) =>
+    n.toLowerCase().endsWith('.json'),
+  );
+  jsonNames.sort((a, b) =>
+    a === 'cases.json' ? -1 : b === 'cases.json' ? 1 : a < b ? -1 : a > b ? 1 : 0,
+  );
+  for (const name of jsonNames) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(join(inputDir, name), 'utf8'));
+    } catch {
+      continue;
+    }
+    const refs = [];
+    manifestRefs(parsed, refs, new Set());
+    for (const ref of refs) {
+      const src = ref.path.startsWith('/') ? ref.path : join(inputDir, ref.path);
+      if (handledSrc.has(src)) continue;
+      try {
+        const img = loadImage(src);
+        if (!img) continue;
+        const dest = ref.id
+          ? join(outputDir, ref.id, 'image.png')
+          : join(outputDir, basename(src, extname(src)) + '.png');
+        writeAnswer(img, dest);
+        handledSrc.add(src);
+        done++;
+      } catch (e) {
+        console.error(`png-squeeze: manifest ref ${ref.path} failed: ${e.message}`);
+      }
+    }
+  }
+  return done;
 }
 
 function main() {
-  const inPath = resolveDir("MAKEFUN_INPUT_DIR", 2, "INPUT_DIR", "/input");
-  const outDir = resolveDir("MAKEFUN_OUTPUT_DIR", 3, "OUTPUT_DIR", "/output");
+  const { inputDir, outputDir } = resolveDirs();
+  let done = 0;
 
-  const jobs = collectJobs(inPath);
-  if (jobs.length === 0) {
-    eprint("png-squeeze: no usable input found at " + inPath);
-    return;
-  }
-
-  try {
-    fs.mkdirSync(outDir, { recursive: true });
-  } catch (err) {
-    eprint("png-squeeze: cannot create output directory " + outDir + ": " + (err && err.message));
-    return;
-  }
-
-  const usedNames = new Set();
-  let written = 0;
-  for (const job of jobs) {
+  // Main path: one subdirectory per instance.
+  for (const id of sortedNames(listEntries(inputDir), true)) {
     try {
-      const img = toRgba(job.buf);
-      if (!img) {
-        eprint("png-squeeze: skip (not a PNG or raw RGBA image): " + job.name);
-        continue;
-      }
-      const png = encodePng(img);
-      let outName = job.name + ".png";
-      let n = 2;
-      while (usedNames.has(outName)) {
-        outName = job.name + "-" + n + ".png";
-        n++;
-      }
-      usedNames.add(outName);
-      fs.writeFileSync(path.join(outDir, outName), png);
-      written++;
-    } catch (err) {
-      eprint("png-squeeze: skip " + job.name + ": " + (err && err.message));
+      const img = firstImageIn(join(inputDir, id));
+      if (!img) continue;
+      const size = writeAnswer(img, join(outputDir, id, 'image.png'));
+      console.error(`png-squeeze: ${id} -> ${id}/image.png (${size} bytes)`);
+      done++;
+    } catch (e) {
+      console.error(`png-squeeze: instance ${id} skipped: ${e.message}`);
     }
   }
-  eprint("png-squeeze: wrote " + written + " file(s) to " + outDir);
+
+  // Fallback only when no instance was found at all.
+  if (done === 0) {
+    try {
+      done = runFallback(inputDir, outputDir);
+    } catch (e) {
+      console.error(`png-squeeze: fallback failed: ${e.message}`);
+    }
+  }
+
+  if (done === 0) {
+    console.error(`png-squeeze: no decodable input found under ${inputDir}`);
+  }
 }
 
 try {
   main();
-} catch (err) {
-  // Last-resort guard: the grading harness only checks the exit code for
-  // run completion, so a fatal surprise must still exit 0.
-  eprint("png-squeeze: fatal error (suppressed): " + (err && err.message));
+} catch (e) {
+  console.error(`png-squeeze: fatal (ignored, exiting 0): ${e && e.message}`);
 }
+// Always exit 0: falling off the end with no pending work.
